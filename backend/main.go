@@ -1,22 +1,28 @@
 package main
 
 import (
-	"encoding/json"
+	"context"
 	"fmt"
+	"io"
 	"log"
 	"net/http"
 	"os"
+	"path/filepath"
+	"strings"
+	"time"
 
-	"github.com/gorilla/handlers"
-	"github.com/gorilla/mux"
+	"cloud.google.com/go/storage"
+	"github.com/gin-gonic/gin"
+	"github.com/google/uuid"
+	"github.com/joho/godotenv"
 )
 
 type WeightConfig struct {
-	Team      float64 `json:"team"`
-	Market    float64 `json:"market"`
-	Product   float64 `json:"product"`
-	Traction  float64 `json:"traction"`
-	Moat      float64 `json:"moat"`
+	Team     float64 `json:"team"`
+	Market   float64 `json:"market"`
+	Product  float64 `json:"product"`
+	Traction float64 `json:"traction"`
+	Moat     float64 `json:"moat"`
 }
 
 type GenerateRequest struct {
@@ -31,55 +37,92 @@ type GenerateResponse struct {
 }
 
 type UploadResponse struct {
-	FileID  string `json:"fileId"`
-	Success bool   `json:"success"`
-	Message string `json:"message"`
+	FileID   string `json:"fileId"`
+	FileURL  string `json:"fileUrl"`
+	Success  bool   `json:"success"`
+	Message  string `json:"message"`
 }
 
-func uploadHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
+var (
+	storageClient *storage.Client
+	bucketName    string
+)
 
-	// Parse multipart form
-	err := r.ParseMultipartForm(32 << 20) // 32 MB max
+func uploadHandler(c *gin.Context) {
+	// Get the uploaded file
+	file, header, err := c.Request.FormFile("file")
 	if err != nil {
-		http.Error(w, "Error parsing form", http.StatusBadRequest)
-		return
-	}
-
-	file, header, err := r.FormFile("file")
-	if err != nil {
-		http.Error(w, "Error retrieving file", http.StatusBadRequest)
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Error retrieving file"})
 		return
 	}
 	defer file.Close()
 
-	// TODO: Upload to Google Cloud Storage
-	// For now, simulate file upload
-	fileID := fmt.Sprintf("file_%s", header.Filename)
+	// Generate unique filename
+	uniqueID := uuid.New().String()
+	timestamp := time.Now().Format("20060102-150405")
+	fileExt := filepath.Ext(header.Filename)
+	baseFilename := strings.TrimSuffix(header.Filename, fileExt)
+	uniqueFilename := fmt.Sprintf("%s-%s-%s%s", timestamp, uniqueID[:8], baseFilename, fileExt)
+
+	fmt.Printf("🚀 RECEIVED FILE UPLOAD: %s (Size: %d bytes) -> %s\n", header.Filename, header.Size, uniqueFilename)
+
+	// Read file content into memory first
+	fileContent, err := io.ReadAll(file)
+	if err != nil {
+		fmt.Printf("ERROR: Failed to read file content: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Failed to read file: %v", err)})
+		return
+	}
+
+	// Upload to Google Cloud Storage
+	ctx := context.Background()
+	bucket := storageClient.Bucket(bucketName)
+	obj := bucket.Object(uniqueFilename)
+	w := obj.NewWriter(ctx)
+
+	// Set content type
+	switch strings.ToLower(fileExt) {
+	case ".pdf":
+		w.ContentType = "application/pdf"
+	case ".ppt", ".pptx":
+		w.ContentType = "application/vnd.ms-powerpoint"
+	default:
+		w.ContentType = "application/octet-stream"
+	}
+
+	// Write content to GCS
+	if _, err := w.Write(fileContent); err != nil {
+		fmt.Printf("ERROR: Failed to write to GCS: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Upload failed: %v", err)})
+		return
+	}
+
+	// Close the writer
+	if err := w.Close(); err != nil {
+		fmt.Printf("ERROR: Failed to close GCS writer: %v\n", err)
+		c.JSON(http.StatusInternalServerError, gin.H{"error": fmt.Sprintf("Upload finalization failed: %v", err)})
+		return
+	}
+
+	fmt.Printf("✅ Successfully uploaded %s to GCS\n", uniqueFilename)
+
+	// Generate public URL
+	publicURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", bucketName, uniqueFilename)
 
 	response := UploadResponse{
-		FileID:  fileID,
+		FileID:  uniqueFilename,
+		FileURL: publicURL,
 		Success: true,
 		Message: "File uploaded successfully",
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	c.JSON(http.StatusOK, response)
 }
 
-func generateHandler(w http.ResponseWriter, r *http.Request) {
-	if r.Method != http.MethodPost {
-		http.Error(w, "Method not allowed", http.StatusMethodNotAllowed)
-		return
-	}
-
+func generateHandler(c *gin.Context) {
 	var req GenerateRequest
-	err := json.NewDecoder(r.Body).Decode(&req)
-	if err != nil {
-		http.Error(w, "Invalid JSON", http.StatusBadRequest)
+	if err := c.ShouldBindJSON(&req); err != nil {
+		c.JSON(http.StatusBadRequest, gin.H{"error": "Invalid JSON"})
 		return
 	}
 
@@ -94,28 +137,70 @@ func generateHandler(w http.ResponseWriter, r *http.Request) {
 		Message:  "Deal note generated successfully",
 	}
 
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(response)
+	c.JSON(http.StatusOK, response)
 }
 
-func healthHandler(w http.ResponseWriter, r *http.Request) {
-	w.Header().Set("Content-Type", "application/json")
-	json.NewEncoder(w).Encode(map[string]string{"status": "healthy"})
+func healthHandler(c *gin.Context) {
+	c.JSON(http.StatusOK, gin.H{"status": "healthy"})
+}
+
+func initGCS() {
+	var err error
+	ctx := context.Background()
+
+	// Get bucket name from environment
+	bucketName = os.Getenv("GCS_BUCKET_NAME")
+	if bucketName == "" {
+		bucketName = "gdgen-upload" // fallback to hardcoded name
+	}
+
+	// Check credentials path
+	credsPath := os.Getenv("GOOGLE_APPLICATION_CREDENTIALS")
+	fmt.Printf("Credentials path: %s\n", credsPath)
+	fmt.Printf("Bucket name: %s\n", bucketName)
+
+	// Initialize GCS client
+	storageClient, err = storage.NewClient(ctx)
+	if err != nil {
+		log.Fatalf("Failed to create storage client: %v", err)
+	}
+
+	fmt.Printf("✅ Initialized GCS client successfully\n")
 }
 
 func main() {
-	r := mux.NewRouter()
+	// Load environment variables from .env file
+	if err := godotenv.Load(); err != nil {
+		log.Printf("Warning: .env file not found: %v", err)
+	}
+
+	// Initialize Google Cloud Storage
+	initGCS()
+	defer storageClient.Close()
+
+	// Set Gin mode
+	gin.SetMode(gin.ReleaseMode)
+	r := gin.Default()
+
+	// CORS middleware
+	r.Use(func(c *gin.Context) {
+		c.Header("Access-Control-Allow-Origin", "*")
+		c.Header("Access-Control-Allow-Methods", "GET, POST, PUT, OPTIONS")
+		c.Header("Access-Control-Allow-Headers", "X-Requested-With, Content-Type, Authorization")
+		if c.Request.Method == "OPTIONS" {
+			c.AbortWithStatus(204)
+			return
+		}
+		c.Next()
+	})
 
 	// API routes
-	api := r.PathPrefix("/api").Subrouter()
-	api.HandleFunc("/upload", uploadHandler).Methods("POST")
-	api.HandleFunc("/generate", generateHandler).Methods("POST")
-	api.HandleFunc("/health", healthHandler).Methods("GET")
-
-	// CORS configuration
-	headersOk := handlers.AllowedHeaders([]string{"X-Requested-With", "Content-Type", "Authorization"})
-	originsOk := handlers.AllowedOrigins([]string{"*"})
-	methodsOk := handlers.AllowedMethods([]string{"GET", "HEAD", "POST", "PUT", "OPTIONS"})
+	api := r.Group("/api")
+	{
+		api.POST("/upload", uploadHandler)
+		api.POST("/generate", generateHandler)
+		api.GET("/health", healthHandler)
+	}
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -123,5 +208,5 @@ func main() {
 	}
 
 	fmt.Printf("Server starting on port %s\n", port)
-	log.Fatal(http.ListenAndServe(":"+port, handlers.CORS(originsOk, headersOk, methodsOk)(r)))
+	r.Run(":" + port)
 }
