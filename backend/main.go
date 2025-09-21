@@ -1,7 +1,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
 	"fmt"
 	"io"
 	"log"
@@ -31,9 +33,19 @@ type GenerateRequest struct {
 }
 
 type GenerateResponse struct {
-	DealNote string `json:"dealNote"`
-	Success  bool   `json:"success"`
-	Message  string `json:"message"`
+	DealNote     string                 `json:"dealNote"`
+	Summary      string                 `json:"summary"`
+	OverallScore float64                `json:"overallScore"`
+	Scorecard    map[string]float64     `json:"scorecard"`
+	Recommendation struct {
+		Label      string  `json:"label"`
+		Confidence float64 `json:"confidence"`
+		Rationale  string  `json:"rationale"`
+	} `json:"recommendation"`
+	Citations   []string `json:"citations"`
+	GeneratedAt string   `json:"generatedAt"`
+	Success     bool     `json:"success"`
+	Message     string   `json:"message"`
 }
 
 type UploadResponse struct {
@@ -43,9 +55,57 @@ type UploadResponse struct {
 	Message  string `json:"message"`
 }
 
+type StartupMeta struct {
+	Name    string `json:"name"`
+	Sector  string `json:"sector"`
+	Stage   string `json:"stage"`
+	Country string `json:"country"`
+}
+
+type AIWeights struct {
+	Team     int `json:"Team"`
+	Market   int `json:"Market"`
+	Product  int `json:"Product"`
+	Traction int `json:"Traction"`
+	Moat     int `json:"Moat"`
+}
+
+type AIServiceRequest struct {
+	GcsPaths []string     `json:"gcs_paths"`
+	Startup  StartupMeta  `json:"startup"`
+	Weights  *AIWeights   `json:"weights"`
+}
+
+type Citation struct {
+	DocID string `json:"doc_id"`
+}
+
+type AIServiceResponse struct {
+	Startup struct {
+		Name    string `json:"name"`
+		Sector  string `json:"sector"`
+		Stage   string `json:"stage"`
+		Country string `json:"country"`
+	} `json:"startup"`
+	Snapshot struct {
+		SummaryMarkdown string `json:"summary_markdown"`
+	} `json:"snapshot"`
+	Scorecard map[string]float64 `json:"scorecard"`
+	Overall   float64            `json:"overall"`
+	Recommendation struct {
+		Label      string  `json:"label"`
+		Confidence float64 `json:"confidence"`
+		Rationale  string  `json:"rationale"`
+	} `json:"recommendation"`
+	Citations   []Citation `json:"citations"`
+	GeneratedAt string     `json:"generated_at"`
+}
+
 var (
 	storageClient *storage.Client
 	bucketName    string
+	aiServiceURL  string
+	httpClient    = &http.Client{Timeout: 300 * time.Second} // Increased to 5 minutes
 )
 
 func uploadHandler(c *gin.Context) {
@@ -119,6 +179,87 @@ func uploadHandler(c *gin.Context) {
 	c.JSON(http.StatusOK, response)
 }
 
+func callAIService(weights WeightConfig, fileIDs []string) (*AIServiceResponse, error) {
+	// Convert weights to AI service format and ensure they sum to 100
+	aiWeights := &AIWeights{
+		Team:     int(weights.Team),
+		Market:   int(weights.Market),
+		Product:  int(weights.Product),
+		Traction: int(weights.Traction),
+		Moat:     int(weights.Moat),
+	}
+
+	// Log the weights being sent
+	total := aiWeights.Team + aiWeights.Market + aiWeights.Product + aiWeights.Traction + aiWeights.Moat
+	fmt.Printf("📊 Sending weights: Team=%d, Market=%d, Product=%d, Traction=%d, Moat=%d (Total=%d)\n",
+		aiWeights.Team, aiWeights.Market, aiWeights.Product, aiWeights.Traction, aiWeights.Moat, total)
+
+	// Convert file IDs to GCS paths
+	var gcsPaths []string
+	for _, fileID := range fileIDs {
+		gcsPath := fmt.Sprintf("gs://%s/%s", bucketName, fileID)
+		gcsPaths = append(gcsPaths, gcsPath)
+	}
+
+	// Prepare request payload
+	aiReq := AIServiceRequest{
+		GcsPaths: gcsPaths,
+		Startup: StartupMeta{
+			Name:    "Demo Startup",
+			Sector:  "Tech",
+			Stage:   "Seed",
+			Country: "US",
+		},
+		Weights: aiWeights,
+	}
+
+	jsonData, err := json.Marshal(aiReq)
+	if err != nil {
+		return nil, fmt.Errorf("failed to marshal request: %v", err)
+	}
+
+	// Create HTTP request
+	req, err := http.NewRequest("POST", aiServiceURL+"/v1/deal-notes/generate", bytes.NewBuffer(jsonData))
+	if err != nil {
+		return nil, fmt.Errorf("failed to create request: %v", err)
+	}
+
+	req.Header.Set("Content-Type", "application/json")
+
+	// Send request
+	resp, err := httpClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("failed to send request: %v", err)
+	}
+	defer resp.Body.Close()
+
+	// Read response
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return nil, fmt.Errorf("failed to read response: %v", err)
+	}
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("AI service returned status %d: %s", resp.StatusCode, string(body))
+	}
+
+	// Log the raw response for debugging
+	fmt.Printf("🔍 AI Service Raw Response: %s\n", string(body))
+
+	// Parse response
+	var aiResp AIServiceResponse
+	if err := json.Unmarshal(body, &aiResp); err != nil {
+		// If parsing fails, try to parse as a generic response first
+		var genericResp map[string]interface{}
+		if parseErr := json.Unmarshal(body, &genericResp); parseErr == nil {
+			fmt.Printf("🔍 Response structure: %+v\n", genericResp)
+		}
+		return nil, fmt.Errorf("failed to parse response: %v", err)
+	}
+
+	return &aiResp, nil
+}
+
 func generateHandler(c *gin.Context) {
 	var req GenerateRequest
 	if err := c.ShouldBindJSON(&req); err != nil {
@@ -126,15 +267,93 @@ func generateHandler(c *gin.Context) {
 		return
 	}
 
-	// TODO: Process files from GCS and call AI service
-	// For now, simulate deal note generation
-	dealNote := fmt.Sprintf("Generated Deal Note based on %d files with weights: Team(%.1f), Market(%.1f), Product(%.1f), Traction(%.1f), Moat(%.1f)",
+	fmt.Printf("🤖 Generating deal note for %d files with weights: Team(%.1f), Market(%.1f), Product(%.1f), Traction(%.1f), Moat(%.1f)\n",
 		len(req.FileIDs), req.Weights.Team, req.Weights.Market, req.Weights.Product, req.Weights.Traction, req.Weights.Moat)
 
+	// Log both public URLs and GCS paths
+	for _, fileID := range req.FileIDs {
+		publicURL := fmt.Sprintf("https://storage.googleapis.com/%s/%s", bucketName, fileID)
+		gcsPath := fmt.Sprintf("gs://%s/%s", bucketName, fileID)
+		fmt.Printf("📄 Public URL: %s\n", publicURL)
+		fmt.Printf("📄 GCS Path: %s\n", gcsPath)
+	}
+
+	// Call AI service
+	aiResp, err := callAIService(req.Weights, req.FileIDs)
+	if err != nil {
+		fmt.Printf("❌ AI service error: %v\n", err)
+		response := GenerateResponse{
+			DealNote: "",
+			Success:  false,
+			Message:  fmt.Sprintf("Failed to generate deal note: %v", err),
+		}
+		c.JSON(http.StatusInternalServerError, response)
+		return
+	}
+
+	fmt.Printf("✅ Deal note generated successfully\n")
+
+	// Extract and clean up citations
+	var citations []string
+	uniqueCitations := make(map[string]bool)
+
+	for _, citation := range aiResp.Citations {
+		// Extract filename from path (remove /tmp/ prefix and make it readable)
+		filename := citation.DocID
+		if strings.HasPrefix(filename, "/tmp/") {
+			filename = strings.TrimPrefix(filename, "/tmp/")
+		}
+
+		// Remove timestamp prefix (e.g., "20250921-212649-cda05e46-")
+		parts := strings.Split(filename, "-")
+		if len(parts) >= 4 {
+			// Keep everything after the UUID part
+			filename = strings.Join(parts[3:], "-")
+		}
+
+		// Add to unique citations
+		if !uniqueCitations[filename] {
+			uniqueCitations[filename] = true
+			citations = append(citations, filename)
+		}
+	}
+
+	// Build scorecard details for markdown
+	scorecardText := "**Individual Scores:**\n"
+	for category, score := range aiResp.Scorecard {
+		scorecardText += fmt.Sprintf("- %s: %.1f/100\n", category, score)
+	}
+
+	// Format citations for markdown
+	citationsText := ""
+	if len(citations) > 0 {
+		citationsText = "\n\n**Sources:**\n"
+		for i, citation := range citations {
+			citationsText += fmt.Sprintf("%d. %s\n", i+1, citation)
+		}
+	}
+
+	dealNoteText := fmt.Sprintf("# Deal Note for %s\n\n%s\n\n**Overall Score:** %.1f/100\n\n%s\n**Recommendation:** %s (Confidence: %.1f%%)\n\n**Rationale:** %s%s\n\n*Generated at: %s*",
+		aiResp.Startup.Name,
+		aiResp.Snapshot.SummaryMarkdown,
+		aiResp.Overall,
+		scorecardText,
+		aiResp.Recommendation.Label,
+		aiResp.Recommendation.Confidence*100,
+		aiResp.Recommendation.Rationale,
+		citationsText,
+		aiResp.GeneratedAt)
+
 	response := GenerateResponse{
-		DealNote: dealNote,
-		Success:  true,
-		Message:  "Deal note generated successfully",
+		DealNote:       dealNoteText,
+		Summary:        aiResp.Snapshot.SummaryMarkdown,
+		OverallScore:   aiResp.Overall,
+		Scorecard:      aiResp.Scorecard,
+		Recommendation: aiResp.Recommendation,
+		Citations:      citations,
+		GeneratedAt:    aiResp.GeneratedAt,
+		Success:        true,
+		Message:        "Deal note generated successfully",
 	}
 
 	c.JSON(http.StatusOK, response)
@@ -168,11 +387,24 @@ func initGCS() {
 	fmt.Printf("✅ Initialized GCS client successfully\n")
 }
 
+func initConfig() {
+	// Get AI service URL from environment
+	aiServiceURL = os.Getenv("AI_SERVICE_URL")
+	if aiServiceURL == "" {
+		aiServiceURL = "http://localhost:8000" // fallback to default FastAPI port
+	}
+
+	fmt.Printf("AI Service URL: %s\n", aiServiceURL)
+}
+
 func main() {
 	// Load environment variables from .env file
 	if err := godotenv.Load(); err != nil {
 		log.Printf("Warning: .env file not found: %v", err)
 	}
+
+	// Initialize configuration
+	initConfig()
 
 	// Initialize Google Cloud Storage
 	initGCS()

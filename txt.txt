@@ -1,0 +1,3 @@
+export GOOGLE_APPLICATION_CREDENTIALS=~/sa.json
+export GOOGLE_CLOUD_PROJECT=hack-deal-generator
+export VERTEXAI_LOCATION=us-central1
