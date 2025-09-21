@@ -1,0 +1,9 @@
+def combine_text(row):
+    parts = [row['descriptions.mediumDesc'], f"with drive({row['R_Main device']})"]
+    if pd.notna(row['R_Coordination breaker']) and row['R_Coordination breaker']:
+        parts.append(f"with breaker({row['R_Coordination breaker']})")
+    if pd.notna(row['R_Coordination contactor']) and row['R_Coordination contactor']:
+        parts.append(f"and contractor({row['R_Coordination contactor']})")
+    return ' '.join(parts)
+
+vsd_catalogue_data['combined_text'] = vsd_catalogue_data.apply(combine_text, axis=1)
